@@ -2,23 +2,23 @@ const watched: unique symbol = Symbol('watched');
 const unwatched: unique symbol = Symbol('unwatched');
 
 function isState(value: unknown): value is State {
-  return value instanceof StateImpl;
+  return value instanceof State;
 }
 
-function isComputed(value: unknown): value is Signal {
-  return value instanceof ComputedImpl;
+function isComputed(value: unknown): value is Computed {
+  return value instanceof Computed;
 }
 
 function introspectSources(s: Computed | Watcher): (State | Computed)[] {
-  if (s instanceof ComputedImpl || s instanceof WatcherImpl) {
-    return s[SIGNAL].sources.slice() as unknown as (State | Computed)[];
+  if (s instanceof Computed || s instanceof Watcher) {
+    return s[SIGNAL].sources.map((s) => s.self);
   }
   throw new TypeError(`value is not a Computed or a Watcher`);
 }
 
 function introspectSinks(s: State | Computed): (Computed | Watcher)[] {
   if (isActualSignal(s)) {
-    return s[SIGNAL].sinks.slice() as unknown as (Computed | Watcher)[];
+    return [...s[SIGNAL].sinks].map((s) => s.self);
   }
   throw new TypeError(`value is not a State or a Computed`);
 }
@@ -27,7 +27,7 @@ function hasSinks(s: State | Computed): boolean {
   if (!isActualSignal(s)) {
     throw new TypeError(`value is not a State or a Computed`);
   }
-  return s[SIGNAL].sinks.length > 0;
+  return s[SIGNAL].sinks.size > 0;
 }
 
 function untrack<T>(cb: () => T): T {
@@ -41,16 +41,7 @@ function untrack<T>(cb: () => T): T {
 }
 
 function currentComputed(): Computed | undefined {
-  return computing || undefined;
-}
-
-export interface State<T = unknown> extends Signal<T> {
-  readonly [State]: true;
-  set(value: T): void;
-}
-
-export interface Computed<T = unknown> extends Signal<T> {
-  readonly [Computed]: true;
+  return computing?.computing.self || undefined;
 }
 
 export type Equals<T> = (this: Signal<T>, one: T, other: T) => boolean;
@@ -63,96 +54,60 @@ export interface SignalOptions<T> {
   [unwatched]?: WatchedCallback<T>;
 }
 
+export type StateInstance<T = unknown> = Omit<State<T>, typeof SIGNAL>;
+
 export type StateCtr = {
-  new <T>(initialValue: T, options?: SignalOptions<T>): State<T>;
+  new <T>(initialValue: T, options?: SignalOptions<T>): StateInstance<T>;
 };
 
+export type ComputedInstance<T = unknown> = Omit<Computed<T>, typeof SIGNAL>;
+
 export type ComputedCtr = {
-  new <T>(computation: Computation<T>, options?: SignalOptions<T>): Computed<T>;
+  new <T>(computation: Computation<T>, options?: SignalOptions<T>): ComputedInstance<T>;
 };
 
 export type WatcherCallback = (this: Watcher) => void;
 
-export interface Watcher {
-  readonly [Watcher]: true;
-  watch(...s: Signal[]): void;
-  unwatch(...s: Signal[]): void;
-  getPending(): Signal[];
-}
-
+export type WatcherInstance = Omit<Watcher, typeof SIGNAL>;
 export type WatcherCtr = {
   new (notify: WatcherCallback): Watcher;
 };
 
-type Version = number | undefined;
-
-let frozen = false;
-let computing: ComputedImpl | null = null;
-let version: Version = 0;
-
-const uninitialized: unique symbol = Symbol('uninitialized');
-const State: unique symbol = Symbol('State');
-const Computed: unique symbol = Symbol('Computed');
-const Watcher: unique symbol = Symbol('Watcher');
-const SIGNAL: unique symbol = Symbol('SIGNAL');
-
-function nextVersion(): Version {
-  if (version === undefined) {
-    version = 0;
-    return version;
+class CurrentlyComputing {
+  sourcesToDiscard: Set<Source>
+  constructor(readonly computing: ComputedImpl){
+    this.sourcesToDiscard = new Set(computing.sources);
   }
-  return version++;
+  
+  addSource(source: Source): void {
+    if(!this.sourcesToDiscard.delete(source) && this.computing.isWatched){
+      source.addSink(this.computing)
+    }
+    this.computing.addSource(source);
+  }
 }
 
-function isNewer(version: Version, thanVersion: Version): boolean {
-  if (version === undefined) {
-    return false;
-  }
-  if (thanVersion === undefined) {
-    return true;
-  }
-  return version > thanVersion;
+type Version = number & { __version__: true};
+
+let frozen = false;
+let computing: CurrentlyComputing | null = null;
+const watcherNotificationErrors: unknown[] = []
+
+const firstVersion = 0 as Version;
+const uninitialized: unique symbol = Symbol('uninitialized');
+const state: unique symbol = Symbol('state');
+const computed: unique symbol = Symbol('computed');
+const watcher: unique symbol = Symbol('watcher');
+const SIGNAL: unique symbol = Symbol('SIGNAL');
+
+function nextVersion(version: Version): Version {
+  return (version + 1) as Version;
 }
 
 type SetSignalValueResult = 'dirty' | 'clean';
 
-function setSignalValue<T>(
-  withValue: SignalImpl<T>,
-  value: undefined,
-  exception: unknown,
-): SetSignalValueResult;
-function setSignalValue<T>(withValue: SignalImpl<T>, value: T): SetSignalValueResult;
-function setSignalValue<T>(
-  withValue: SignalImpl<T>,
-  v?: T,
-  exception?: unknown,
-): SetSignalValueResult {
-  const signal = withValue[SIGNAL];
-  if (exception === undefined) {
-    const value = v as T;
-    const currentValue = signal.value;
-    if (currentValue === uninitialized) {
-      signal.value = value;
-      signal.exceptionValue = undefined;
-      return 'dirty';
-    }
-    try {
-      if (signal.equals.apply(withValue, [value, currentValue])) {
-        return 'clean';
-      }
-      signal.value = value;
-      signal.exceptionValue = undefined;
-    } catch (e) {
-      signal.exceptionValue = e;
-    }
-  } else {
-    signal.exceptionValue = exception;
-  }
-  return 'dirty';
-}
-
-function isActualSignal<T>(signal: Signal<T>): signal is StateImpl<T> | ComputedImpl<T> {
-  return signal instanceof StateImpl || signal instanceof ComputedImpl;
+function isActualSignal<T>(signal: Signal<T>): signal is State<T> | Computed<T> {
+  return signal instanceof State || signal instanceof Computed;
 }
 
 type Sink = WatcherImpl | ComputedImpl;
@@ -164,525 +119,468 @@ function throwIfFrozen(): void {
   }
 }
 
-function freeze(): void {
-  frozen = true;
-}
-
-function unfreeze(): void {
-  frozen = false;
-}
-
-type SignalImpl<T = unknown> = StateImpl<T> | ComputedImpl<T>;
-
 class StateImpl<T = unknown> {
-  readonly [SIGNAL]: {
-    value: T | typeof uninitialized;
-    exceptionValue: unknown;
-    equals: Equals<T>;
-    watched: WatchedCallback<T> | undefined;
-    unwatched: WatchedCallback<T> | undefined;
-    sinks: Sink[];
-    unwatchedSinks: Sink[];
-    version: Version;
-  };
-  readonly [State] = true;
-  constructor(initialValue: T, options?: SignalOptions<T>) {
-    this[SIGNAL] = {
-      value: initialValue,
-      exceptionValue: undefined,
-      equals: options?.equals || ((one, other) => Object.is(one, other)),
-      watched: options?.[watched],
-      unwatched: options?.[unwatched],
-      sinks: [],
-      unwatchedSinks: [],
-      version: nextVersion(),
-    };
+  self: State<T>;
+  value: T;
+  exceptionValue: unknown;
+  #equals: Equals<T>;
+  watched: WatchedCallback<T> | undefined;
+  unwatched: WatchedCallback<T> | undefined;
+  sinks: Set<Sink>;
+  version: Version;
+  constructor(self: State<T>, initialValue: T, options?: SignalOptions<T>) {
+    this.self = self;
+    this.value = initialValue;
+    this.#equals = options?.equals || ((one, other) => Object.is(one, other));
+    this.watched = options?.[watched];
+    this.unwatched = options?.[unwatched];
+    this.sinks = new Set();
+    this.version = firstVersion;
   }
 
-  addUnwatchedSink(sink: Sink): void {
-    if (!this[SIGNAL].sinks.includes(sink)) {
-      this[SIGNAL].unwatchedSinks.push(sink);
-    }
+  get pending(): boolean {
+    return false;
   }
 
-  removeUnwatchedSinks(): void {
-    this[SIGNAL].unwatchedSinks.splice(0, this[SIGNAL].unwatchedSinks.length);
+  get clean(): boolean {
+    return true;
   }
 
-  removeSink(sink: Sink): void {
-    const index = this[SIGNAL].sinks.indexOf(sink);
-    if (index === -1) {
-      return;
+  traverseAndCompute(version?: Version): SetSignalValueResult {
+    if(version !== undefined && this.version > version){
+      return 'dirty'
     }
-    this[SIGNAL].sinks.splice(index, 1);
-    const unwatchedCallback = this[SIGNAL].unwatched;
-    if (this[SIGNAL].sinks.length === 0 && unwatchedCallback) {
-      freeze();
-      try {
-        unwatchedCallback.apply(this);
-      } catch {}
-      unfreeze();
-    }
+    return 'clean';
   }
 
   addSink(sink: Sink): void {
-    this[SIGNAL].sinks.push(sink);
-    const watched = this[SIGNAL].watched;
-    if (this[SIGNAL].sinks.length === 1 && watched) {
-      freeze();
+    this.sinks.add(sink);
+    const watched = this.watched;
+    if (this.sinks.size === 1 && watched) {
+      frozen = true;
       try {
-        watched.apply(this);
+        watched.apply(this.self);
       } catch {}
-      unfreeze();
+      frozen = false;
+    }
+  }
+
+  removeSink(sink: Sink): void {
+    this.sinks.delete(sink)
+    const unwatchedCallback = this.unwatched;
+    if (this.sinks.size === 0 && unwatchedCallback) {
+      frozen = true;
+      try {
+        unwatchedCallback.apply(this.self);
+      } catch {}
+      frozen = false;
     }
   }
 
   findChanges(): void {}
 
-  traverseAndCompute(): SetSignalValueResult {
-    return 'clean';
-  }
-
-  get() {
-    if (!(this instanceof StateImpl)) {
-      throw new TypeError(`this is not a State`);
-    }
+  set(value: T): void {
     throwIfFrozen();
-    if (computing) {
-      computing.addSource(this as Source);
-    }
-    if (this[SIGNAL].exceptionValue !== undefined) {
-      throw this[SIGNAL].exceptionValue;
-    }
-    return this[SIGNAL].value as T;
-  }
-
-  set(value: T) {
-    if (!(this instanceof StateImpl)) {
-      throw new TypeError(`this is not a State`);
-    }
-    throwIfFrozen();
-    const setValueResult = setSignalValue(this, value);
+    const setValueResult = this.#setValue(value);
     if (setValueResult === 'clean') {
       return undefined;
     }
     if (computing === null) {
-      this[SIGNAL].version = nextVersion();
+      this.version = nextVersion(this.version);
     }
 
-    for (const sink of this[SIGNAL].sinks) {
+    watcherNotificationErrors.length = 0;
+    frozen = true;
+    for (const sink of this.sinks) {
       sink.notifySourceChanged();
     }
-    const watchersToNotify = new Set(
-      this[SIGNAL].sinks
-        .map((s) => s.findWatchersToNotify())
-        .reduce<WatcherImpl[]>((a, b) => a.concat([...b]), []),
-    );
-    const errors: unknown[] = [];
-    for (const watcherToNotify of watchersToNotify) {
-      try {
-        watcherToNotify.notify();
-      } catch (e) {
-        errors.push(e);
+    frozen = false;
+    if (watcherNotificationErrors.length > 0) {
+      throw new AggregateError(watcherNotificationErrors);
+    }
+  }
+
+  get(): T {
+    throwIfFrozen();
+    if (computing) {
+      computing.addSource(this as Source);
+    }
+    if (this.exceptionValue !== undefined) {
+      throw this.exceptionValue;
+    }
+    return this.value;
+  }
+
+  #setValue(newValue: T): SetSignalValueResult {
+    try {
+      if (this.#equals.apply(this.self, [newValue, this.value])) {
+        return 'clean';
       }
+      this.value = newValue;
+      this.exceptionValue = undefined;
+    } catch (e) {
+      this.exceptionValue = e;
     }
-    if (errors.length > 0) {
-      throw new AggregateError(errors);
-    }
+    return 'dirty';
   }
 }
 
 type ComputedState = 'clean' | 'checked' | 'computing' | 'dirty';
 
-function sourceIsPending(source: Source): boolean {
-  if (!(source instanceof ComputedImpl)) {
-    return false;
-  }
-  return source[SIGNAL].state === 'dirty' || source[SIGNAL].state === 'checked';
-}
-
-function sourceIsClean(source: Source): boolean {
-  if (!(source instanceof ComputedImpl)) {
-    return true;
-  }
-  return source[SIGNAL].state === 'clean';
-}
-
 class ComputedImpl<T = unknown> {
-  [SIGNAL]: {
-    value: T | typeof uninitialized;
-    exceptionValue: unknown;
-    equals: Equals<T>;
-    watched: WatchedCallback<T> | undefined;
-    unwatched: WatchedCallback<T> | undefined;
-    sinks: Sink[];
-    unwatchedSinks: Sink[];
-    sources: Source[];
-    sourceVersions: Version[];
-    isWatched: boolean;
-    version: Version;
-    state: ComputedState;
-    computation: Computation<T>;
-  };
-  readonly [Computed] = true;
-  constructor(computation: Computation<T>, options?: SignalOptions<T>) {
-    this[SIGNAL] = {
-      value: uninitialized,
-      exceptionValue: undefined,
-      equals: options?.equals || ((one, other) => Object.is(one, other)),
-      watched: options?.[watched],
-      unwatched: options?.[unwatched],
-      sinks: [],
-      unwatchedSinks: [],
-      version: undefined,
-      sources: [],
-      sourceVersions: [],
-      isWatched: false,
-      state: 'dirty',
-      computation,
-    };
+  self: Computed<T>;
+  value: T | typeof uninitialized;
+  exceptionValue: unknown;
+  #equals: Equals<T>;
+  watched: WatchedCallback<T> | undefined;
+  unwatched: WatchedCallback<T> | undefined;
+  sinks: Set<Sink>;
+  sources: Source[];
+  sourceVersions: Version[];
+  isWatched: boolean;
+  version: Version;
+  state: ComputedState;
+  computation: Computation<T>;
+  constructor(self: Computed<T>, computation: Computation<T>, options?: SignalOptions<T>) {
+    this.self = self;
+    this.value = uninitialized;
+    this.#equals = options?.equals || ((one, other) => Object.is(one, other));
+    this.watched = options?.[watched];
+    this.unwatched = options?.[unwatched];
+    this.sinks = new Set();
+    this.sources = [];
+    this.sourceVersions = [];
+    this.isWatched = false;
+    this.state = 'dirty';
+    this.computation = computation;
+    this.version = firstVersion;
   }
 
-  traverseAndCompute(): SetSignalValueResult {
-    if (this[SIGNAL].state === 'checked') {
-      for (const source of this[SIGNAL].sources) {
-        const sourceResult = source.traverseAndCompute();
-        if (sourceResult === 'dirty') {
-          break;
-        }
-      }
-    }
-    if (this[SIGNAL].state === 'clean') {
-      return 'clean';
-    }
-    if (this[SIGNAL].state === 'dirty') {
-      return this.compute();
-    }
-    return 'dirty';
+  get pending(): boolean {
+    return this.state === 'dirty' || this.state === 'checked';
   }
 
-  compute(): SetSignalValueResult {
-    const computationResult = this.#getComputationResult();
-    if (computationResult === 'clean') {
-      this.#notifySinksThisClean();
-    } else {
-      this.#notifySinksThisChanged();
-    }
-    return computationResult;
-  }
-
-  notifySourceClean(): void {
-    if (!this[SIGNAL].sources.every((s) => sourceIsClean(s))) {
-      return;
-    }
-    if (this[SIGNAL].state === 'checked') {
-      this[SIGNAL].state = 'clean';
-      this.#notifySinksThisClean();
-    }
-  }
-
-  notifySourceChanged(): void {
-    if (this[SIGNAL].state === 'clean' || this[SIGNAL].state === 'checked') {
-      this[SIGNAL].state = 'dirty';
-    }
-    for (const sink of this[SIGNAL].sinks) {
-      sink.notifySourceNeedsComputation();
-    }
-    for (const unwatchedSink of this[SIGNAL].unwatchedSinks) {
-      unwatchedSink.notifySourceNeedsComputation();
-    }
-  }
-
-  notifySourceNeedsComputation(): void {
-    if (this[SIGNAL].state === 'clean') {
-      this[SIGNAL].state = 'checked';
-    }
-    for (const sink of this[SIGNAL].sinks) {
-      sink.notifySourceNeedsComputation();
-    }
-    for (const unwatchedSink of this[SIGNAL].unwatchedSinks) {
-      unwatchedSink.notifySourceNeedsComputation();
-    }
-  }
-
-  *findWatchersToNotify(): Iterable<WatcherImpl> {
-    for (const sink of this[SIGNAL].sinks) {
-      yield* sink.findWatchersToNotify();
-    }
-  }
-
-  findChanges(): void {
-    for (let i = 0; i < this[SIGNAL].sources.length; i++) {
-      const source = this[SIGNAL].sources[i];
-      source.findChanges();
-      const sourceVersion = this[SIGNAL].sourceVersions[i];
-      const sourceHasChanged = isNewer(source[SIGNAL].version, sourceVersion);
-      if (sourceHasChanged) {
-        this.notifySourceChanged();
-      }
-    }
-  }
-
-  addSource(source: Source): void {
-    this[SIGNAL].sources.push(source);
-    this[SIGNAL].sourceVersions.push(source[SIGNAL].version);
-  }
-
-  removeSink(sink: Sink): void {
-    const index = this[SIGNAL].sinks.indexOf(sink);
-    if (index === -1) {
-      return;
-    }
-    this[SIGNAL].sinks.splice(index, 1);
-    if (this[SIGNAL].sinks.length === 0) {
-      const unwatchedCallback = this[SIGNAL].unwatched;
-      if (unwatchedCallback) {
-        freeze();
-        try {
-          unwatchedCallback.apply(this);
-        } catch {}
-        unfreeze();
-      }
-      this[SIGNAL].isWatched = false;
-      for (const source of this[SIGNAL].sources) {
-        source.removeSink(this as ComputedImpl);
-      }
-    }
+  get clean(): boolean {
+    return this.state === 'clean';
   }
 
   addSink(sink: Sink): void {
-    this[SIGNAL].sinks.push(sink);
+    this.sinks.add(sink);
 
-    if (this[SIGNAL].sinks.length === 1) {
-      const watchedCallback = this[SIGNAL].watched;
+    if (this.sinks.size === 1) {
+      const watchedCallback = this.watched;
       if (watchedCallback) {
-        freeze();
+        frozen = true;
         try {
-          watchedCallback.apply(this);
+          watchedCallback.apply(this.self);
         } catch {}
-        unfreeze();
+        frozen = false;
       }
-      this[SIGNAL].isWatched = true;
-      for (const source of this[SIGNAL].sources) {
-        source.addSink(this as ComputedImpl);
+      this.isWatched = true;
+      for (const source of this.sources) {
+        source.addSink(this as Sink);
       }
       this.findChanges();
     }
   }
 
-  addUnwatchedSink(sink?: Sink): void {
-    if (sink && !this[SIGNAL].sinks.includes(sink)) {
-      this[SIGNAL].unwatchedSinks.push(sink);
-    }
-    for (const source of this[SIGNAL].sources) {
-      source.addUnwatchedSink(this as ComputedImpl);
+  removeSink(sink: Sink): void {
+    this.sinks.delete(sink);
+    if (this.sinks.size === 0) {
+      const unwatchedCallback = this.unwatched;
+      if (unwatchedCallback) {
+        frozen = true;
+        try {
+          unwatchedCallback.apply(this.self);
+        } catch {}
+        frozen = false;
+      }
+      this.isWatched = false;
+      for (const source of this.sources) {
+        source.removeSink(this as Sink);
+      }
     }
   }
 
-  removeUnwatchedSinks(): void {
-    this[SIGNAL].unwatchedSinks.splice(0, this[SIGNAL].unwatchedSinks.length);
-    for (const source of this[SIGNAL].sources) {
-      source.removeUnwatchedSinks();
+  findChanges(): void {
+    let sourceHasChanged = false;
+    for (let i = 0; i < this.sources.length; i++) {
+      const source = this.sources[i];
+      source.findChanges();
+      if(sourceHasChanged){
+        continue;
+      }
+      const sourceVersion = this.sourceVersions[i];
+      const thisSourceHasChanged = source.version > sourceVersion;
+      if (thisSourceHasChanged) {
+        sourceHasChanged = true;
+        break;
+      }
     }
+    if(sourceHasChanged){
+      this.notifySourceChanged();
+    }
+  }
+
+  addSource(source: Source): void {
+    this.sources.push(source);
+    this.sourceVersions.push(source.version);
+  }
+
+  notifySourceChanged(): void {
+    if (this.state === 'clean' || this.state === 'checked') {
+      this.state = 'dirty';
+    }
+    for (const sink of this.sinks) {
+      sink.notifySourceNeedsComputation();
+    }
+  }
+
+  notifySourceNeedsComputation(): void {
+    if (this.state === 'clean') {
+      this.state = 'checked';
+    }
+    for (const sink of this.sinks) {
+      sink.notifySourceNeedsComputation();
+    }
+  }
+
+  traverseAndCompute(version?: Version): SetSignalValueResult {
+    if(this.isWatched && this.state === 'clean') {
+      return 'clean';
+    }
+    if(this.state === 'dirty') {
+      return this.#getComputationResult();
+    }
+    if(!this.isWatched && version !== undefined && this.version > version){
+      return 'dirty';
+    }
+    let sourceHasChanged = false;
+    for(let i = 0; i < this.sources.length; i++) {
+      const source = this.sources[i];
+      const sourceVersion = this.sourceVersions[i];
+      const sourceResult = source.traverseAndCompute(sourceVersion);
+      if(sourceResult === 'dirty'){
+        sourceHasChanged = true;
+        break;
+      }
+    }
+    if(sourceHasChanged) {
+      return this.#getComputationResult();
+    }
+    this.state = 'clean';
+    return 'clean';
   }
 
   get(): T {
-    if (!(this instanceof ComputedImpl)) {
-      throw new TypeError(`this is not a State`);
-    }
     throwIfFrozen();
-    if (this[SIGNAL].state === 'computing') {
+    if (this.state === 'computing') {
       throw new Error('computing');
     }
-    let unwatchedSinksAdded = false;
-    if (this[SIGNAL].state === 'clean' && !this[SIGNAL].isWatched) {
-      if (computing === null) {
-        this.addUnwatchedSink();
-        unwatchedSinksAdded = true;
-        this.findChanges();
-      }
-    }
-    if (this[SIGNAL].state === 'checked' || this[SIGNAL].state === 'dirty') {
-      if (computing === null) {
-        this.traverseAndCompute();
-      } else {
-        this.compute();
-      }
-    }
-    if (unwatchedSinksAdded) {
-      this.removeUnwatchedSinks();
-    }
+    this.traverseAndCompute();
     if (computing) {
-      computing.addSource(this as ComputedImpl);
+      computing.addSource(this as Source);
     }
 
-    if (this[SIGNAL].exceptionValue !== undefined) {
-      throw this[SIGNAL].exceptionValue;
+    if (this.exceptionValue !== undefined) {
+      throw this.exceptionValue;
     }
-    if (this[SIGNAL].value === uninitialized) {
+    if (this.value === uninitialized) {
       throw new Error('cannot happen');
     }
-    return this[SIGNAL].value;
+    return this.value;
   }
 
   #getComputationResult(): SetSignalValueResult {
-    const oldSources = new Set(this[SIGNAL].sources.splice(0, this[SIGNAL].sources.length));
-    this[SIGNAL].sourceVersions.splice(0, this[SIGNAL].sourceVersions.length);
     const previouslyComputing = computing;
-    computing = this as ComputedImpl;
-    this[SIGNAL].state = 'computing';
-    let newExceptionValue: unknown;
-    let newValue: T = undefined as T;
+    const currentlyComputing = new CurrentlyComputing(this as ComputedImpl);
+    this.sources.length = 0;
+    this.sourceVersions.length = 0;
+    computing = currentlyComputing;;
+    this.state = 'computing';
+    let setValueResult: SetSignalValueResult = 'dirty';
     try {
-      newValue = this[SIGNAL].computation.apply(this);
+      setValueResult = this.#setValue(this.computation.apply(this.self));
     } catch (e) {
-      newExceptionValue = e;
+      this.exceptionValue = e;
     }
 
-    const setValueResult =
-      newExceptionValue !== undefined
-        ? setSignalValue(this, undefined, newExceptionValue)
-        : setSignalValue(this, newValue);
     computing = previouslyComputing;
-    const newSources = new Set(this[SIGNAL].sources);
-    const sourcesToDiscard = oldSources.difference(newSources);
-    for (const sourceToDiscard of sourcesToDiscard) {
+    for (const sourceToDiscard of currentlyComputing.sourcesToDiscard) {
       sourceToDiscard.removeSink(this as Sink);
     }
-    if (this[SIGNAL].isWatched) {
-      const newlyAddedSources = newSources.difference(oldSources);
-      for (const newlyAddedSource of newlyAddedSources) {
-        newlyAddedSource.addSink(this as Sink);
-      }
-    }
     if (setValueResult === 'dirty') {
-      this[SIGNAL].version = nextVersion();
+      this.version = nextVersion(this.version);
     }
-    this[SIGNAL].state = 'clean';
+    this.state = 'clean';
     return setValueResult;
   }
 
-  #notifySinksThisClean(): void {
-    for (const sink of this[SIGNAL].sinks) {
-      sink.notifySourceClean();
+  #setValue(newValue: T): SetSignalValueResult {
+    if (this.value === uninitialized) {
+      this.value = newValue;
+      return 'dirty';
     }
-    for (const unwatchedSink of this[SIGNAL].unwatchedSinks) {
-      unwatchedSink.notifySourceClean();
+    try {
+      if (this.#equals.apply(this.self, [newValue, this.value])) {
+        return 'clean';
+      }
+      this.value = newValue;
+      this.exceptionValue = undefined;
+    } catch (e) {
+      this.exceptionValue = e;
     }
-  }
-
-  #notifySinksThisChanged(): void {
-    for (const sink of this[SIGNAL].sinks) {
-      sink.notifySourceChanged();
-    }
-    for (const unwatchedSink of this[SIGNAL].unwatchedSinks) {
-      unwatchedSink.notifySourceChanged();
-    }
+    return 'dirty';
   }
 }
 
 type WatcherState = 'waiting' | 'watching' | 'pending';
 
 class WatcherImpl {
-  [SIGNAL]: {
-    sources: Source[];
-    state: WatcherState;
-    notify: WatcherCallback;
-  };
-  [Watcher]: true = true;
-  constructor(notify: WatcherCallback) {
-    this[SIGNAL] = {
-      sources: [],
-      state: 'waiting',
-      notify,
-    };
-  }
-
-  notifySourceNeedsComputation(): void {
-    if (this[SIGNAL].state === 'watching') {
-      this[SIGNAL].state = 'pending';
-    }
+  self: Watcher;
+  sources: Source[];
+  state: WatcherState;
+  #watcherCallback: WatcherCallback;
+  constructor(self: Watcher, notify: WatcherCallback) {
+    this.self = self;
+    this.sources = [];
+    this.state = 'waiting';
+    this.#watcherCallback = notify;
   }
 
   notifySourceChanged(): void {
-    if (this[SIGNAL].state === 'watching') {
-      this[SIGNAL].state = 'pending';
+    this.#notify();
+  }
+
+  notifySourceNeedsComputation(): void {
+    this.#notify();
+  }
+
+  #notify(): void {
+    if(this.state === 'waiting'){
+      return;
+    }
+    let exception: unknown;
+    try {
+      this.#watcherCallback.call(this.self);
+    } catch (e) {
+      exception = e;
+    }
+    this.state = 'waiting';
+    if (exception) {
+      watcherNotificationErrors.push(exception);
     }
   }
 
   notifySourceClean(): void {}
 
-  findWatchersToNotify(): Iterable<WatcherImpl> {
-    if (this[SIGNAL].state !== 'pending') {
-      return [];
+  watch(s: Source[]): void {
+    throwIfFrozen();
+    for (const sourceToWatch of s) {
+      this.sources.push(sourceToWatch);
+      sourceToWatch.addSink(this);
     }
-    return [this];
+    if (this.state === 'waiting') {
+      this.state = 'watching';
+    }
   }
 
-  notify(): void {
-    let exception: unknown;
-    freeze();
-    try {
-      this[SIGNAL].notify.call(this);
-    } catch (e) {
-      exception = e;
+  unwatch(s: Source[]): void {
+    throwIfFrozen();
+    for (const sourceToUnwatch of s) {
+      const index = this.sources.indexOf(sourceToUnwatch);
+      this.sources.splice(index, 1);
+      sourceToUnwatch.removeSink(this);
     }
-    unfreeze();
-    this[SIGNAL].state = 'waiting';
-    if (exception) {
-      throw exception;
+    if (this.sources.length === 0 && this.state === 'watching') {
+      this.state = 'waiting';
     }
+  }
+
+  getPending(): Source[] {
+    return this.sources.filter((s) => s.pending);
+  }
+}
+class Watcher {
+  [SIGNAL]: WatcherImpl;
+  [watcher]: true = true;
+  constructor(notify: WatcherCallback) {
+    this[SIGNAL] = new WatcherImpl(this, notify);
   }
 
   watch(...s: Signal[]): void {
-    if (!(this instanceof WatcherImpl)) {
+    if (!(this instanceof Watcher)) {
       throw new TypeError(`this is not a Watcher`);
     }
-    throwIfFrozen();
+
     const sourcesToWatch: Source[] = [];
     for (const value of s) {
       if (!isActualSignal(value)) {
         throw new TypeError(`value is not a Signal: ${value}`);
       }
-      sourcesToWatch.push(value);
+      sourcesToWatch.push(value[SIGNAL]);
     }
-    for (const sourceToWatch of sourcesToWatch) {
-      this[SIGNAL].sources.push(sourceToWatch);
-      sourceToWatch.addSink(this);
-    }
-    if (this[SIGNAL].state === 'waiting') {
-      this[SIGNAL].state = 'watching';
-    }
+    this[SIGNAL].watch(sourcesToWatch);
   }
   unwatch(...s: Signal[]): void {
-    if (!(this instanceof WatcherImpl)) {
+    if (!(this instanceof Watcher)) {
       throw new TypeError(`this is not a Watcher`);
     }
-    throwIfFrozen();
+
     const sourcesToUnwatch: Source[] = [];
     for (const value of s) {
       if (!isActualSignal(value)) {
         throw new TypeError(`value is not a Signal: ${value}`);
       }
-      if (!this[SIGNAL].sources.includes(value)) {
+      if (!this[SIGNAL].sources.includes(value[SIGNAL])) {
         throw new Error(`signal is not watched by this Watcher: ${value}`);
       }
-      sourcesToUnwatch.push(value);
+      sourcesToUnwatch.push(value[SIGNAL]);
     }
-    for (const sourceToUnwatch of sourcesToUnwatch) {
-      const index = this[SIGNAL].sources.indexOf(sourceToUnwatch);
-      this[SIGNAL].sources.splice(index, 1);
-      sourceToUnwatch.removeSink(this);
-    }
-    if (this[SIGNAL].sources.length === 0 && this[SIGNAL].state === 'watching') {
-      this[SIGNAL].state = 'waiting';
-    }
+    this[SIGNAL].unwatch(sourcesToUnwatch);
   }
   getPending(): Signal[] {
-    if (!(this instanceof WatcherImpl)) {
+    if (!(this instanceof Watcher)) {
       throw new TypeError(`this is not a Watcher`);
     }
-    return this[SIGNAL].sources.filter((s) => sourceIsPending(s));
+    return this[SIGNAL].getPending().map((s) => s.self);
+  }
+}
+
+class State<T = unknown> {
+  readonly [SIGNAL]: StateImpl<T>;
+  readonly [state] = true;
+  constructor(initialValue: T, options?: SignalOptions<T>) {
+    this[SIGNAL] = new StateImpl(this, initialValue, options);
+  }
+
+  get(): T {
+    if (!(this instanceof State)) {
+      throw new TypeError(`this is not a State`);
+    }
+    return this[SIGNAL].get();
+  }
+
+  set(value: T) {
+    if (!(this instanceof State)) {
+      throw new TypeError(`this is not a State`);
+    }
+    this[SIGNAL].set(value);
+  }
+}
+
+class Computed<T = unknown> {
+  [SIGNAL]: ComputedImpl<T>;
+  readonly [computed] = true;
+  constructor(computation: Computation<T>, options?: SignalOptions<T>) {
+    this[SIGNAL] = new ComputedImpl(this, computation, options);
+  }
+
+  get(): T {
+    if (!(this instanceof Computed)) {
+      throw new TypeError(`this is not a Computed`);
+    }
+    return this[SIGNAL].get();
   }
 }
 
@@ -690,25 +588,25 @@ export abstract class Signal<T = unknown> {
   abstract get(): T;
   static State: StateCtr;
   static Computed: ComputedCtr;
-  static isState: (value: unknown) => value is State;
-  static isComputed: (value: unknown) => value is Signal;
+  static isState: (value: unknown) => value is StateInstance;
+  static isComputed: (value: unknown) => value is ComputedInstance;
   static subtle: {
     readonly watched: symbol;
     readonly unwatched: symbol;
     Watcher: WatcherCtr;
-    introspectSources(s: Computed | Watcher): (State | Computed)[];
-    introspectSinks(s: State | Computed): (Signal | Watcher)[];
-    hasSinks(s: State | Computed): boolean;
+    introspectSources(s: ComputedInstance | WatcherInstance): (StateInstance | ComputedInstance)[];
+    introspectSinks(s: StateInstance | ComputedInstance): (ComputedInstance | WatcherInstance)[];
+    hasSinks(s: StateInstance | ComputedInstance): boolean;
     untrack<T>(cb: () => T): T;
-    currentComputed(): Computed | undefined;
+    currentComputed(): ComputedInstance | undefined;
   };
   static {
-    this.State = StateImpl;
-    this.Computed = ComputedImpl;
+    this.State = State;
+    this.Computed = Computed;
     this.subtle = {
       watched,
       unwatched,
-      Watcher: WatcherImpl,
+      Watcher: Watcher,
       introspectSources,
       introspectSinks,
       hasSinks,
