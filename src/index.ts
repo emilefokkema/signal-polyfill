@@ -306,10 +306,6 @@ class ComputedImpl<T = unknown> {
     let sourceHasChanged = false;
     for (let i = 0; i < this.sources.length; i++) {
       const source = this.sources[i];
-      source.findChanges();
-      if(sourceHasChanged){
-        continue;
-      }
       const sourceVersion = this.sourceVersions[i];
       const thisSourceHasChanged = source.version > sourceVersion;
       if (thisSourceHasChanged) {
